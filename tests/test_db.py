@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from ai.incident_parser import IncidentAction
+from backend.api import ACTION_EXAMPLES
 from init_db import (
     apply_operation,
     connect,
@@ -95,22 +96,10 @@ def test_apply_operation_rejects_bad_input(scenario_db, operation):
 
 def test_every_parser_action_is_supported(scenario_db):
     """Guards against the parser and the database drifting apart."""
-    example = {
-        "increase_stock": {"warehouse": "W1", "quantity": 10},
-        "decrease_stock": {"warehouse": "W1", "quantity": 10},
-        "set_stock": {"warehouse": "W1", "quantity": 50},
-        "warehouse_offline": {"warehouse": "W2"},
-        "warehouse_online": {"warehouse": "W2"},
-        "set_demand": {"shelter": "S3", "quantity": 120},
-        "truck_offline": {"truck": "T1"},
-        "truck_online": {"truck": "T1"},
-        "close_route": {"warehouse": "W4", "shelter": "S3"},
-        "open_route": {"warehouse": "W4", "shelter": "S3"},
-    }
     actions = [a.value for a in IncidentAction]
-    assert set(actions) == set(example)
+    assert set(actions) == set(ACTION_EXAMPLES)
     for action in actions:
-        apply_operation(scenario_db, {"action": action, **example[action]}, action)
+        apply_operation(scenario_db, {"action": action, **ACTION_EXAMPLES[action]}, action)
     assert _count(scenario_db, "incidents") == len(actions)
 
 
