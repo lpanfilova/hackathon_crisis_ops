@@ -5,5 +5,9 @@ pydantic>=2.6
 pydantic-settings>=2.2
 python-dotenv>=1.0
 
+# Allocation optimizer (HiGHS via scipy.optimize.milp)
+numpy==2.5.4
+scipy==1.18.1
+
 # Test-only
 httpx>=0.27
