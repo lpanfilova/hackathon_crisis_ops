@@ -4,6 +4,7 @@ import sqlite3
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from ai.incident_parser import IncidentUpdate, ParseError, parse_incident
@@ -13,6 +14,19 @@ from init_db import apply_operation, connect, resolve_operation
 from optimization.allocator import plan_from_db
 
 app = FastAPI(title="CrisisOps Incident API")
+
+# Lets the standalone frontend (python3 frontend/app.py, port 8000) call this
+# API when it runs on another port, e.g. uvicorn backend.api:app --port 8001.
+# Browsers treat 127.0.0.1 and localhost as different origins, so list both.
+# Not needed when uvicorn serves the page itself (GET /), which is same-origin.
+CORS_ORIGINS = ["http://127.0.0.1:8000", "http://localhost:8000"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
+
 app.include_router(display_router)  # GET /state, GET /plan, POST /plan/preview
 app.include_router(frontend_router)  # GET / serves the dashboard on the API's origin
 
