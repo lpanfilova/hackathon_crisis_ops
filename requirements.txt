@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+boto3>=1.34
+pydantic>=2.6
+pydantic-settings>=2.2
+python-dotenv>=1.0
+
+# Test-only
+httpx>=0.27
