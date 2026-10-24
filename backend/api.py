@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from ai.incident_parser import IncidentUpdate, ParseError, parse_incident
 from backend.display_api import router as display_router
 from backend.frontend_page import router as frontend_router
-from init_db import apply_operation, connect
+from init_db import apply_operation, connect, resolve_operation
 from optimization.allocator import plan_from_db
 
 app = FastAPI(title="CrisisOps Incident API")
@@ -122,12 +122,15 @@ def apply_incident(request: ApplyRequest) -> dict[str, Any]:
     status, shelter demand, truck status, and route open/close. ``method``
     omitted uses ``ALLOCATOR_METHOD`` from the environment.
 
-    The operation uses database ids (``W1``, ``S3``, ``T1``). Returns HTTP 422
-    when the action is invalid or would make stock or demand negative.
+    Targets may be database ids (``W1``, ``S3``, ``T1``) or what
+    ``/incidents/parse`` returns (``A``, ``3``); the response echoes the
+    resolved ids. Returns HTTP 422 when the action or a target is invalid, or
+    the change would make stock or demand negative.
     """
     operation = request.operation.model_dump(mode="json", exclude_none=True)
     conn = connect()
     try:
+        operation = resolve_operation(conn, operation)
         apply_operation(conn, operation, request.text)
         plans = plan_from_db(conn, method=request.method)
     except ValueError as exc:

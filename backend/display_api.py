@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 from ai.incident_parser import IncidentUpdate
 from backend.config import get_allocator_settings
-from init_db import apply_operation, available_inventory, connect
+from init_db import apply_operation, available_inventory, connect, resolve_operation
 from optimization.allocator import plan_from_db
 
 router = APIRouter(tags=["display"])
@@ -238,7 +238,8 @@ def preview_plan(request: PreviewRequest) -> dict[str, Any]:
     The current database is copied into memory, the operation is applied to
     the copy, and both states are planned. Returns HTTP 422 for an invalid
     operation (unknown id, missing field, stock or demand going negative).
-    Operation ids are database ids (W1, S3, T1), as for /incidents/apply.
+    Targets may be database ids (W1, S3, T1) or what /incidents/parse returns
+    (A, 3), as for /incidents/apply; the response echoes the resolved ids.
     """
     operation = request.operation.model_dump(mode="json", exclude_none=True)
     disk = _open()
@@ -250,6 +251,7 @@ def preview_plan(request: PreviewRequest) -> dict[str, Any]:
         before = _decorate(plan_from_db(disk, method=request.method), disk)
         kits_before = _available_kits(disk)
         try:
+            operation = resolve_operation(scratch, operation)
             apply_operation(scratch, operation, request.text)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
