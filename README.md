@@ -22,7 +22,7 @@ flowchart LR
     M["Distribution manager"] -->|types an incident| UI["Dashboard<br/>(browser)"]
     UI -->|HTTP / JSON| API["FastAPI backend"]
     API -->|"sentence → operation"| BR["Amazon Bedrock<br/>Claude Haiku 4.5"]
-    API -->|read / write| DB[("SQLite<br/>warehouses · shelters · trucks<br/>routes · incidents")]
+    API -->|read / write| DB[("SQLite (default) or Amazon DynamoDB<br/>warehouses · shelters · trucks<br/>routes · incidents")]
     API -->|current state| OPT["Allocator<br/>SciPy · HiGHS"]
     OPT -->|delivery plan| API
 ```
@@ -64,7 +64,9 @@ python3 frontend/app.py                                   # dashboard → http:/
 .venv/bin/uvicorn backend.api:app --port 8001 --reload    # API       → http://127.0.0.1:8001/docs
 ```
 
-Tests: `.venv/bin/python -m pytest -q` (119 tests; Bedrock is mocked, no AWS needed).
+**Use Amazon DynamoDB instead of SQLite:** add `DATABASE_BACKEND=dynamodb` to `.env`, then run `.venv/bin/python init_db.py reset` (creates the `crisisops` table if missing and loads the demo). Every request then uses DynamoDB only. If credentials or the table are missing, the API reports an error and never falls back to SQLite.
+
+Tests: `.venv/bin/python -m pytest -q` (126 tests; Bedrock and DynamoDB are mocked, no AWS needed).
 
 ## API
 
@@ -85,6 +87,7 @@ ai/incident_parser.py       Bedrock call, tool schema, validation
 backend/api.py              parse / apply endpoints, CORS
 backend/display_api.py      state / plan / preview endpoints
 backend/schema.sql          5 tables with foreign keys and no-negative-stock checks
+backend/dynamodb_store.py   DynamoDB version of the same data and writes
 init_db.py                  build or reset the database, apply operations, match names to IDs
 optimization/allocator.py   fairness-first optimizer and greedy baseline
 data/demo_scenario.json     Bay County demo data and scripted incidents
@@ -97,5 +100,4 @@ Settings live in `.env` (see `.env.example`): Bedrock model and region, default 
 
 - The road network is simulated: distance is 1.3 × the straight line. No traffic or live road data.
 - One shelter per trip, and trucks return to their home warehouse.
-- Shelter priority is used by the greedy baseline only. CrisisOps weighs every shelter's unmet share equally.
-- Local demo: no login or access control.
+- Shelter priority is used by the greedy baseline only. App weighs every shelter's unmet share equally.
