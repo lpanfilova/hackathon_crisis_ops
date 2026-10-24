@@ -7,10 +7,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from ai.incident_parser import IncidentUpdate, ParseError, parse_incident
+from backend.display_api import router as display_router
+from backend.frontend_page import router as frontend_router
 from init_db import apply_operation, connect
 from optimization.allocator import plan_from_db
 
 app = FastAPI(title="CrisisOps Incident API")
+app.include_router(display_router)  # GET /state, GET /plan, POST /plan/preview
+app.include_router(frontend_router)  # GET / serves the dashboard on the API's origin
 
 # One example operation per action. Ids are database ids (W1, S3, T1), the
 # same shape ``init_db.apply_operation`` accepts. These are safe to replay in
