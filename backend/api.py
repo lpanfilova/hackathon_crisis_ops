@@ -1,6 +1,7 @@
 """Backend API routes."""
 
 import sqlite3
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -8,12 +9,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from ai.incident_parser import IncidentUpdate, ParseError, parse_incident
+from backend.database import store_status, use_dynamodb
 from backend.display_api import router as display_router
 from backend.frontend_page import router as frontend_router
 from init_db import apply_operation, connect, resolve_operation
 from optimization.allocator import plan_from_db
 
-app = FastAPI(title="CrisisOps Incident API")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Fail startup in DynamoDB mode when the table or credentials are missing."""
+    if use_dynamodb():
+        from backend.dynamodb_store import get_dynamo_store
+
+        get_dynamo_store().ensure_ready()
+    yield
+
+
+app = FastAPI(title="CrisisOps Incident API", lifespan=_lifespan)
 
 # Lets the standalone frontend (python3 frontend/app.py, port 8000) call this
 # API when it runs on another port, e.g. uvicorn backend.api:app --port 8001.
@@ -140,7 +153,12 @@ def apply_incident(request: ApplyRequest) -> dict[str, Any]:
     ``/incidents/parse`` returns (``A``, ``3``); the response echoes the
     resolved ids. Returns HTTP 422 when the action or a target is invalid, or
     the change would make stock or demand negative.
+
+    ``DATABASE_BACKEND=dynamodb`` writes the same operation to DynamoDB.
+    ``sqlite`` (the default) is unchanged. A DynamoDB error does not write here.
     """
+    if use_dynamodb():
+        return _apply_dynamodb(request)
     operation = request.operation.model_dump(mode="json", exclude_none=True)
     conn = connect()
     try:
@@ -161,4 +179,22 @@ def apply_incident(request: ApplyRequest) -> dict[str, Any]:
         ) from exc
     finally:
         conn.close()
+    return {"text": request.text, "operation": operation, "plans": plans}
+
+
+def _apply_dynamodb(request: ApplyRequest) -> dict[str, Any]:
+    """Apply one confirmed operation in DynamoDB, then recompute the plan."""
+    from backend.dynamodb_store import get_dynamo_store
+
+    operation = request.operation.model_dump(mode="json", exclude_none=True)
+    try:
+        store = get_dynamo_store()
+        operation = store.apply_operation(operation, request.text)
+        plans = store.plans(method=request.method)
+        print(f"DynamoDB applied {operation}", flush=True)
+    except Exception as exc:
+        mapped = store_status(exc)
+        if mapped is not None:
+            raise mapped from exc
+        raise
     return {"text": request.text, "operation": operation, "plans": plans}

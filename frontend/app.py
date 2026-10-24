@@ -4,10 +4,13 @@ Run with::
 
     python3 frontend/app.py
 
-Then open http://127.0.0.1:8000. The repository currently has no implemented
-backend routes, parser, allocator, or data schema, so this frontend uses a
-clearly-labelled local demonstration scenario. UI state stays in the browser
-and the integration boundary is intentionally isolated in ``window.CrisisOps``.
+Then open http://127.0.0.1:8000. The page loads live data from the CrisisOps
+FastAPI backend, which must run separately on port 8001::
+
+    uvicorn backend.api:app --port 8001
+
+All API calls go through ``window.CrisisOps.api`` in the page script. The page's
+Content-Security-Policy allows ``connect-src`` to that one API origin only.
 """
 
 from __future__ import annotations
@@ -19,6 +22,8 @@ from typing import Final
 
 HOST: Final = "127.0.0.1"
 PORT: Final = 8000
+# FastAPI backend origin. Must match API_BASE in the page script below.
+API_ORIGIN: Final = "http://127.0.0.1:8001"
 
 PAGE: Final = r'''<!doctype html>
 <html lang="en" data-theme="light">
@@ -155,6 +160,8 @@ PAGE: Final = r'''<!doctype html>
       content: ""; position: absolute; inset: -4px; border: 1px solid var(--success);
       border-radius: inherit; opacity: .25; animation: pulse 2.4s infinite;
     }
+    .sync-block.offline .sync-dot { background: var(--danger); }
+    .sync-block.offline .sync-dot::after { border-color: var(--danger); }
     @keyframes pulse { 70%, 100% { transform: scale(1.7); opacity: 0; } }
     .sync-label { color: var(--text-3); font-size: 10px; letter-spacing: .07em; text-transform: uppercase; font-weight: 700; line-height: 1; }
     .sync-time { margin-top: 4px; color: var(--text); font-size: 12px; font-variant-numeric: tabular-nums; line-height: 1; }
@@ -282,7 +289,8 @@ PAGE: Final = r'''<!doctype html>
       padding: 7px 11px; font-size: 10px; font-weight: 720; display: inline-flex; align-items: center; gap: 6px;
       transition: background .15s ease, transform .15s ease;
     }
-    .analyze-button:hover { background: var(--brand-strong); transform: translateY(-1px); }
+    .analyze-button:hover:not(:disabled) { background: var(--brand-strong); transform: translateY(-1px); }
+    .analyze-button:disabled { cursor: progress; opacity: .6; }
     .analyze-button svg { width: 12px; height: 12px; }
 
     .interpretation { margin-top: 13px; border: 1px solid var(--border); border-radius: 15px; overflow: hidden; background: var(--surface-2); }
@@ -449,7 +457,7 @@ PAGE: Final = r'''<!doctype html>
       </div>
     </div>
     <div class="header-actions">
-      <div class="sync-block" title="Local demonstration data is active">
+      <div class="sync-block" id="sync-block" title="Time of the most recent confirmed incident">
         <span class="sync-dot" aria-hidden="true"></span>
         <div><div class="sync-label">Last updated</div><div class="sync-time" id="last-updated">—</div></div>
       </div>
@@ -468,13 +476,13 @@ PAGE: Final = r'''<!doctype html>
         <p class="page-description">Monitor supply, interpret disruptions, and coordinate equitable relief.</p>
       </div>
       <div class="status-pills" aria-label="System status">
-        <div class="status-pill"><span class="mini-dot"></span><strong>Operations active</strong></div>
-        <div class="status-pill">Scenario <strong>Bay Area · Demo</strong></div>
+        <div class="status-pill" id="api-status"><span class="mini-dot"></span><strong>Connecting to API…</strong></div>
+        <div class="status-pill">Scenario <strong>Bay County · Demo</strong></div>
       </div>
     </div>
 
     <div class="connection-banner" id="connection-banner" role="status">
-      <span><strong>Demo mode:</strong> No backend API is implemented in this repository. Changes are kept in this browser session.</span>
+      <span id="connection-message"></span>
       <button class="sample-button" id="dismiss-banner" type="button">Dismiss</button>
     </div>
 
@@ -539,30 +547,125 @@ PAGE: Final = r'''<!doctype html>
       check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 12 4 4L19 6"/></svg>'
     };
 
+    // FastAPI backend (uvicorn backend.api:app --port 8001). Must match API_ORIGIN,
+    // which frontend/app.py adds to the page's Content-Security-Policy connect-src.
+    const API_BASE = 'http://127.0.0.1:8001';
+
+    function emptyIncident() {
+      return {
+        text: '',              // original text sent to POST /incidents/parse
+        operation: null,       // exact JSON returned by POST /incidents/parse
+        resolved: null,        // same operation with database ids, echoed by preview/apply
+        comparison: null,      // comparison[method] from POST /plan/preview
+        parsing: false,
+        previewing: false,
+        applying: false,
+        confirmed: false,
+        error: '',             // parse or apply failure shown in the review panel
+        previewError: '',
+        previewBlocksConfirm: false, // backend rejected the operation (HTTP 422)
+        uncertain: false       // apply outcome unknown (no readable response)
+      };
+    }
+
     const state = {
-      incidentConfirmed: false,
-      analyzed: false,
-      extraction: null,
       activeModal: null,
-      warehouses: [
-        { name: 'North Bay Depot', location: 'Santa Rosa · Sonoma Co.', kits: 38, capacity: 50, status: 'Operational' },
-        { name: 'South Bay Hub', location: 'San José · Santa Clara Co.', kits: 52, capacity: 60, status: 'Operational' }
-      ],
-      shelters: [
-        { name: 'Harbor Community Center', location: 'Oakland · 164 residents', need: 30, priority: 'High' },
-        { name: 'Mission Civic Shelter', location: 'San Francisco · 112 residents', need: 24, priority: 'Medium' },
-        { name: 'Eastside Relief Center', location: 'San José · 138 residents', need: 36, priority: 'High' }
-      ],
-      assignments: [
-        { from: 'North Bay Depot', to: 'Harbor Center', kits: 28, eta: '42 min', status: 'Ready' },
-        { from: 'South Bay Hub', to: 'Mission Civic', kits: 24, eta: '51 min', status: 'Ready' },
-        { from: 'South Bay Hub', to: 'Eastside Relief', kits: 34, eta: '24 min', status: 'Ready' }
-      ],
-      shortages: [
-        { shelter: 'Harbor Community Center', requested: 30, allocated: 28, gap: 2 },
-        { shelter: 'Mission Civic Shelter', requested: 24, allocated: 24, gap: 0 },
-        { shelter: 'Eastside Relief Center', requested: 36, allocated: 34, gap: 2 }
-      ]
+      connection: 'connecting', // 'connecting' | 'online' | 'offline'
+      connectionMessage: '',
+      data: null,               // last GET /state response
+      plan: null,               // one plan from GET /plan (plans.optimal when present)
+      planGeneratedAt: null,
+      draftText: '',
+      incident: emptyIncident()
+    };
+
+    // Increments whenever an incident is started or cleared, so late responses
+    // from an abandoned request can't overwrite newer UI state.
+    let incidentSeq = 0;
+    let dashboardRequest = null;
+
+    class ApiError extends Error {
+      constructor(message, status = 0, body = null) {
+        super(message);
+        this.name = 'ApiError';
+        this.status = status;   // 0 = no readable HTTP response
+        this.body = body;
+      }
+    }
+
+    // FastAPI errors are {"detail": "text"} from HTTPException, or
+    // {"detail": [{"msg": ...}, ...]} from request validation.
+    function describeError(status, body, rawText) {
+      const detail = body && body.detail;
+      let message;
+      if (typeof detail === 'string') message = detail;
+      else if (Array.isArray(detail)) message = detail.map(item => (item && item.msg) ? item.msg : JSON.stringify(item)).join('; ');
+      else if (rawText) message = rawText.slice(0, 200);
+      else message = 'Request failed.';
+      return `${message} (HTTP ${status})`;
+    }
+
+    async function isApiReachable() {
+      try { await apiRequest('/health', { timeoutMs: 4000 }); return true; } catch { return false; }
+    }
+
+    async function apiRequest(path, { method = 'GET', body, timeoutMs = 30000 } = {}) {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+      const options = { method, signal: controller.signal, headers: { Accept: 'application/json' } };
+      if (body !== undefined) {
+        options.headers['Content-Type'] = 'application/json';
+        options.body = JSON.stringify(body);
+      }
+      try {
+        let response;
+        try {
+          response = await fetch(`${API_BASE}${path}`, options);
+        } catch (error) {
+          if (error.name === 'AbortError') throw new ApiError(`${method} ${path} timed out after ${timeoutMs / 1000} seconds.`);
+          // fetch() only rejects when no readable response arrived: server down,
+          // or a server crash whose 500 response carried no CORS headers.
+          const reachable = path !== '/health' && await isApiReachable();
+          if (reachable) throw new ApiError(`The API is running, but ${method} ${path} failed without a readable response (usually an unhandled server error). Check the uvicorn terminal.`);
+          const message = `Could not reach the CrisisOps API at ${API_BASE}. Start it with: uvicorn backend.api:app --port 8001`;
+          setConnection('offline', message);
+          throw new ApiError(message);
+        }
+        const rawText = await response.text();
+        let data = null;
+        try { data = rawText ? JSON.parse(rawText) : null; } catch { data = null; }
+        if (!response.ok) throw new ApiError(describeError(response.status, data, rawText), response.status, data);
+        return data;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+
+    // One function per backend route. Request bodies match backend/api.py and
+    // backend/display_api.py; responses are returned unchanged.
+    const api = Object.freeze({
+      baseUrl: API_BASE,
+      health: () => apiRequest('/health', { timeoutMs: 5000 }),
+      getState: () => apiRequest('/state'),
+      getPlan: () => apiRequest('/plan'),
+      previewPlan: ({ text, operation }) => apiRequest('/plan/preview', { method: 'POST', body: { text, operation } }),
+      parseIncident: text => apiRequest('/incidents/parse', { method: 'POST', body: { text } }),
+      applyIncident: ({ text, operation }) => apiRequest('/incidents/apply', { method: 'POST', body: { text, operation }, timeoutMs: 60000 })
+    });
+
+    // plans is keyed by planner name; prefer the default optimizer's plan.
+    function pickPlanKey(plans) {
+      if (!plans) return null;
+      if (plans.optimal) return 'optimal';
+      if (plans.greedy) return 'greedy';
+      return Object.keys(plans)[0] || null;
+    }
+
+    const ACTION_LABELS = {
+      increase_stock: 'Increase stock', decrease_stock: 'Decrease stock', set_stock: 'Set stock',
+      warehouse_offline: 'Warehouse offline', warehouse_online: 'Warehouse online',
+      set_demand: 'Set shelter demand', truck_offline: 'Truck offline', truck_online: 'Truck online',
+      close_route: 'Close route', open_route: 'Open route'
     };
 
     const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));
@@ -573,106 +676,356 @@ PAGE: Final = r'''<!doctype html>
       return new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' }).format(date);
     }
 
+    const fmt = value => Number(value).toLocaleString();
+
+    // Shown in a panel while live data is loading or unavailable.
+    function placeholderMarkup(loadingText) {
+      const message = state.connection === 'offline'
+        ? `<strong>Live data unavailable</strong><br>${escapeHtml(state.connectionMessage)}`
+        : `<strong>${escapeHtml(loadingText)}</strong>`;
+      return `<div class="empty-ai"><div>${message}</div></div>`;
+    }
+
+    // Renders GET /state: summary counts plus warehouse and shelter lists.
     function stateMarkup(expanded = false) {
-      const available = state.warehouses.reduce((sum, item) => sum + item.kits, 0);
-      const warehouses = state.warehouses.map(item => `
+      const data = state.data;
+      if (!data) return placeholderMarkup('Loading live data from GET /state…');
+      const s = data.summary;
+      const live = state.connection === 'online' ? 'Live' : 'Last loaded';
+      const warehouses = data.warehouses.map(item => {
+        // Bar = this warehouse's share of all stock (the API has no capacity field).
+        const share = s.total_stock ? Math.round(item.usable_stock / s.total_stock * 100) : 0;
+        return `
         <div class="resource-item">
-          <div><div class="resource-name">${escapeHtml(item.name)}</div><div class="resource-meta">${escapeHtml(item.location)} · ${escapeHtml(item.status)}</div></div>
-          <div class="inventory"><div class="inventory-value">${item.kits} / ${item.capacity} kits</div><div class="progress"><span style="width:${Math.round(item.kits / item.capacity * 100)}%"></span></div></div>
-        </div>`).join('');
-      const shelters = state.shelters.map(item => `
+          <div><div class="resource-name">${escapeHtml(item.name)}</div><div class="resource-meta">${escapeHtml(item.location)} · ${item.is_operational ? 'Operational' : 'Offline'} · ${fmt(item.trucks_operational)}/${fmt(item.trucks_total)} trucks</div></div>
+          <div class="inventory"><div class="inventory-value">${fmt(item.usable_stock)} kits</div><div class="progress${item.is_operational ? '' : ' warning'}" title="${share}% of total stock"><span style="width:${share}%"></span></div></div>
+        </div>`;
+      }).join('');
+      // Stable sort keeps the API's id order within each priority (1 = most urgent).
+      const shelters = [...data.shelters].sort((a, b) => a.priority - b.priority).map(item => `
         <div class="resource-item">
-          <div><div class="resource-name">${escapeHtml(item.name)}</div><div class="resource-meta">${escapeHtml(item.location)}</div></div>
-          <div><span class="tag ${item.priority === 'High' ? 'warning' : 'neutral'}">${escapeHtml(item.priority)} priority</span></div>
+          <div><div class="resource-name">${escapeHtml(item.name)}</div><div class="resource-meta">${escapeHtml(item.location)} · needs ${fmt(item.demand)} kits</div></div>
+          <div><span class="tag ${item.priority === 1 ? 'warning' : 'neutral'}">Priority ${escapeHtml(item.priority)}</span></div>
         </div>`).join('');
+      const allWarehousesUp = s.warehouses_operational === s.warehouses;
       return `
         <div class="metrics">
-          <div class="metric-card"><div class="metric-top"><span class="metric-label">Available kits</span><span class="metric-icon">${ICONS.box}</span></div><div class="metric-value">${available}<span class="metric-unit">kits</span></div><div class="metric-delta">100% accounted for</div></div>
-          <div class="metric-card"><div class="metric-top"><span class="metric-label">Warehouses</span><span class="metric-icon">${ICONS.warehouse}</span></div><div class="metric-value">${state.warehouses.length}</div><div class="metric-delta">All operational</div></div>
-          <div class="metric-card"><div class="metric-top"><span class="metric-label">Shelters</span><span class="metric-icon">${ICONS.shelter}</span></div><div class="metric-value">${state.shelters.length}</div><div class="metric-delta">414 residents</div></div>
+          <div class="metric-card"><div class="metric-top"><span class="metric-label">Available kits</span><span class="metric-icon">${ICONS.box}</span></div><div class="metric-value">${fmt(s.available_kits)}<span class="metric-unit">kits</span></div><div class="metric-delta">of ${fmt(s.total_stock)} in stock</div></div>
+          <div class="metric-card"><div class="metric-top"><span class="metric-label">Warehouses</span><span class="metric-icon">${ICONS.warehouse}</span></div><div class="metric-value">${fmt(s.warehouses)}</div><div class="metric-delta"${allWarehousesUp ? '' : ' style="color:var(--warning)"'}>${allWarehousesUp ? 'All operational' : `${fmt(s.warehouses_operational)} operational`}</div></div>
+          <div class="metric-card"><div class="metric-top"><span class="metric-label">Shelters</span><span class="metric-icon">${ICONS.shelter}</span></div><div class="metric-value">${fmt(s.shelters)}</div><div class="metric-delta">${fmt(s.total_demand)} kits needed</div></div>
         </div>
         <div class="${expanded ? 'resource-layout' : ''}">
-          <section class="resource-section"><div class="section-head"><h4 class="section-title">Warehouses</h4><span class="section-count">Live inventory</span></div><div class="resource-list">${warehouses}</div></section>
-          <section class="resource-section"><div class="section-head"><h4 class="section-title">Active shelters</h4><span class="section-count">By priority</span></div><div class="resource-list">${shelters}</div></section>
+          <section class="resource-section"><div class="section-head"><h4 class="section-title">Warehouses</h4><span class="section-count">${live} · ${fmt(s.trucks_operational)}/${fmt(s.trucks)} trucks · ${fmt(s.routes_closed)} routes closed</span></div><div class="resource-list">${warehouses}</div></section>
+          <section class="resource-section"><div class="section-head"><h4 class="section-title">Active shelters</h4><span class="section-count">By priority (1 = most urgent)</span></div><div class="resource-list">${shelters}</div></section>
         </div>`;
     }
 
+    // Confirm only a parsed, previewed, unchanged incident that isn't already saved.
+    function canConfirm() {
+      const i = state.incident;
+      return Boolean(i.operation) && !i.parsing && !i.previewing && !i.applying && !i.confirmed
+        && !i.uncertain && !i.previewBlocksConfirm && state.draftText.trim() === i.text;
+    }
+
+    function confirmLabel() {
+      const i = state.incident;
+      if (i.applying) return 'Applying incident…';
+      if (i.confirmed) return 'Incident confirmed';
+      if (i.previewing) return 'Previewing impact…';
+      if (i.operation && state.draftText.trim() !== i.text) return 'Analyze again to confirm';
+      return 'Confirm incident';
+    }
+
+    // "A" from the parser, "W1" from the backend's id resolution, name from GET /state.
+    function describeTarget(kind, raw, resolvedId) {
+      if (!resolvedId) return String(raw);
+      const list = kind === 'warehouse' ? state.data?.warehouses : kind === 'shelter' ? state.data?.shelters : null;
+      const match = list ? list.find(item => item.id === resolvedId) : null;
+      if (String(raw) === resolvedId && !match) return resolvedId;
+      return `${raw} → ${resolvedId}${match ? ' · ' + match.name : ''}`;
+    }
+
+    function reviewBadge() {
+      const i = state.incident;
+      if (i.parsing) return '<span class="tag neutral" style="margin-left:auto">Analyzing…</span>';
+      if (i.applying) return '<span class="tag neutral" style="margin-left:auto">Applying…</span>';
+      if (i.confirmed) return '<span class="confidence">Confirmed</span>';
+      if (i.error || i.previewBlocksConfirm) return '<span class="tag danger" style="margin-left:auto">Needs attention</span>';
+      if (i.operation) return '<span class="confidence">Parsed by AI</span>';
+      return '';
+    }
+
+    function reviewStatus() {
+      const i = state.incident;
+      if (i.applying) return ['Saving to the database and recalculating the plan…', 'var(--text-2)'];
+      if (i.confirmed) return ['Saved. Current State and the allocation plan now show the updated data.', 'var(--success)'];
+      if (i.error) return [`Not applied: ${i.error}`, 'var(--danger)'];
+      if (i.previewing) return ['Calculating before/after impact (preview only, nothing saved)…', 'var(--text-2)'];
+      if (i.previewError) return [`Impact preview failed: ${i.previewError}${i.previewBlocksConfirm ? ' Confirmation is disabled because the backend rejected this operation.' : ''}`, 'var(--danger)'];
+      if (i.comparison) return ['Impact preview is in Revise Plan. Nothing is saved until you confirm.', 'var(--text-2)'];
+      return ['', ''];
+    }
+
     function extractionMarkup() {
-      if (!state.analyzed || !state.extraction) return '<div class="empty-ai"><div>Describe an incident, then select <strong>Analyze incident</strong><br>to review structured operational details.</div></div>';
-      const e = state.extraction;
-      return `<div class="extraction-grid">
-        <div class="extraction-item"><span>Incident type</span><strong>${escapeHtml(e.type)}</strong></div>
-        <div class="extraction-item"><span>Severity</span><strong><span class="tag ${e.severity === 'Critical' ? 'danger' : 'warning'}">${escapeHtml(e.severity)}</span></strong></div>
-        <div class="extraction-item"><span>Affected location</span><strong>${escapeHtml(e.location)}</strong></div>
-        <div class="extraction-item"><span>Estimated delay</span><strong>${escapeHtml(e.delay)}</strong></div>
-        <div class="extraction-item"><span>Resource impact</span><strong>${escapeHtml(e.impact)}</strong></div>
-        <div class="extraction-item"><span>Recommended action</span><strong>${escapeHtml(e.action)}</strong></div>
-      </div>`;
+      const i = state.incident;
+      if (i.parsing) return '<div class="empty-ai"><div><strong>Analyzing incident…</strong><br>Waiting for the AI parser.</div></div>';
+      if (!i.operation) {
+        if (i.error) return `<div class="empty-ai"><div><strong style="color:var(--danger)">Could not interpret this incident</strong><br>${escapeHtml(i.error)}</div></div>`;
+        return '<div class="empty-ai"><div>Describe an incident, then select <strong>Analyze incident</strong><br>to review the structured operation before confirming.</div></div>';
+      }
+      // Only fields the parser actually returned (non-null) are shown.
+      const op = i.operation;
+      const resolved = i.resolved || {};
+      const items = [['Action', ACTION_LABELS[op.action] || op.action]];
+      if (op.warehouse != null) items.push(['Warehouse', describeTarget('warehouse', op.warehouse, resolved.warehouse)]);
+      if (op.shelter != null) items.push(['Shelter', describeTarget('shelter', op.shelter, resolved.shelter)]);
+      if (op.truck != null) items.push(['Truck', describeTarget('truck', op.truck, resolved.truck)]);
+      if (op.quantity != null) items.push(['Quantity', `${fmt(op.quantity)} kits`]);
+      const [statusText, statusColor] = reviewStatus();
+      return `<div class="extraction-grid">${items.map(([label, value]) => `<div class="extraction-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join('')}</div>
+        ${statusText ? `<div class="ai-subtitle" style="margin-top:11px;font-size:10px;color:${statusColor}">${escapeHtml(statusText)}</div>` : ''}`;
     }
 
     function incidentMarkup(context = 'main') {
       const suffix = context === 'modal' ? '-modal' : '';
-      return `<form class="incident-form" data-incident-form="${context}">
+      const i = state.incident;
+      const busy = i.parsing || i.applying;
+      return `<form class="incident-form" data-incident-form="${context}" aria-busy="${busy}">
         <div class="field-label-row"><label class="field-label" for="incident-text${suffix}">Enter incident description</label><span class="field-hint">Plain language · Be specific</span></div>
         <div class="textarea-wrap">
-          <textarea id="incident-text${suffix}" maxlength="800" aria-describedby="incident-help${suffix}" placeholder="Example: Flooding has closed Highway 880 near Oakland, delaying the North Bay delivery by approximately two hours."></textarea>
-          <span class="sr-only" id="incident-help${suffix}">Describe location, disruption, delay, and affected supplies when known.</span>
-          <div class="textarea-actions"><button class="sample-button" type="button" data-sample>Use sample incident</button><button class="analyze-button" type="submit">${ICONS.spark} Analyze incident</button></div>
+          <textarea id="incident-text${suffix}" data-focus="text" maxlength="800" aria-describedby="incident-help${suffix}" placeholder="Example: Warehouse B lost power and stopped shipping.">${escapeHtml(state.draftText)}</textarea>
+          <span class="sr-only" id="incident-help${suffix}">Name the warehouse, shelter, or truck affected and the number of kits when known.</span>
+          <div class="textarea-actions"><button class="sample-button" type="button" data-sample data-focus="sample">Use sample incident</button><button class="analyze-button" type="submit" data-focus="analyze" ${busy ? 'disabled' : ''}>${ICONS.spark} ${i.parsing ? 'Analyzing…' : 'Analyze incident'}</button></div>
         </div>
         <section class="interpretation" aria-live="polite">
-          <div class="interpretation-header"><div class="ai-mark">${ICONS.spark}</div><div><div class="ai-title">AI interpretation</div><div class="ai-subtitle">Review extracted information before confirmation</div></div>${state.analyzed ? '<span class="confidence">92% confidence</span>' : ''}</div>
+          <div class="interpretation-header"><div class="ai-mark">${ICONS.spark}</div><div><div class="ai-title">AI interpretation</div><div class="ai-subtitle">Review extracted information before confirmation</div></div>${reviewBadge()}</div>
           <div class="interpretation-body">${extractionMarkup()}</div>
         </section>
-        <div class="form-actions"><button class="button primary" type="button" data-confirm ${state.analyzed ? '' : 'disabled'}>${state.incidentConfirmed ? 'Incident confirmed' : 'Confirm incident'}</button><button class="button ghost" type="button" data-cancel>Clear</button></div>
+        <div class="form-actions"><button class="button primary" type="button" data-confirm data-focus="confirm" ${canConfirm() ? '' : 'disabled'}>${confirmLabel()}</button><button class="button ghost" type="button" data-cancel data-focus="clear" ${i.applying ? 'disabled' : ''}>Clear</button></div>
       </form>`;
     }
 
+    // Metric keys from POST /plan/preview comparison rows (display_api._metric_rows).
+    const HIGHER_IS_BETTER = new Set(['kits_delivered', 'coverage_pct', 'worst_shelter_coverage_pct']);
+    const NEUTRAL_METRICS = new Set(['truck_hours']);
+
+    function metricValue(key, value) {
+      if (key.endsWith('_pct')) return `${value}%`;
+      if (key === 'truck_hours') return `${value} h`;
+      return fmt(value);
+    }
+
+    function metricChange(key, change) {
+      if (!change) return ['No change', 'text-muted'];
+      const sign = change > 0 ? '+' : '−';
+      const size = Math.abs(change);
+      const text = key.endsWith('_pct') ? `${sign}${size} pts` : key === 'truck_hours' ? `${sign}${size} h` : `${sign}${fmt(size)}`;
+      if (NEUTRAL_METRICS.has(key)) return [text, 'text-muted'];
+      const better = HIGHER_IS_BETTER.has(key) ? change > 0 : change < 0;
+      return [text, better ? 'impact-positive' : 'shortage-value'];
+    }
+
+    function comparisonMarkup() {
+      const i = state.incident;
+      let tag = '<span class="tag neutral">Awaiting incident</span>';
+      let rows;
+      if (i.comparison) {
+        tag = i.confirmed ? '<span class="tag success">Applied</span>' : '<span class="tag warning">Preview · not saved</span>';
+        rows = i.comparison.metrics.map(m => {
+          const [changeText, changeClass] = metricChange(m.key, m.change);
+          return `<tr><td>${escapeHtml(m.label)}</td><td class="text-muted">${escapeHtml(metricValue(m.key, m.before))}</td><td>${escapeHtml(metricValue(m.key, m.after))}</td><td class="${changeClass}">${escapeHtml(changeText)}</td></tr>`;
+        }).join('');
+      } else {
+        const message = i.previewing ? 'Calculating preview…'
+          : i.previewError ? `Preview unavailable: ${i.previewError}`
+          : i.parsing ? 'Waiting for the parsed incident…'
+          : 'Analyze an incident to preview its impact on this plan.';
+        rows = `<tr><td colspan="4" class="text-muted" style="white-space:normal">${escapeHtml(message)}</td></tr>`;
+      }
+      return `<section class="data-card"><div class="data-card-header"><span class="data-card-title">Before vs. revised plan</span>${tag}</div><div class="table-wrap"><table><thead><tr><th>Metric</th><th>Before</th><th>Revised</th><th>Impact</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+    }
+
+    // Renders one plan from GET /plan (shipments + shelters) and the preview comparison.
     function planMarkup(expanded = false) {
-      const assigned = state.assignments.reduce((sum, item) => sum + item.kits, 0);
-      const gap = state.shortages.reduce((sum, item) => sum + item.gap, 0);
-      const assignments = state.assignments.map(item => `<tr><td><span class="route">${escapeHtml(item.from)} <span class="route-arrow">→</span> ${escapeHtml(item.to)}</span></td><td><strong>${item.kits}</strong></td><td>${escapeHtml(item.eta)}</td><td><span class="tag success">${escapeHtml(item.status)}</span></td></tr>`).join('');
-      const shortages = state.shortages.map(item => `<tr><td><strong>${escapeHtml(item.shelter)}</strong></td><td>${item.requested}</td><td>${item.allocated}</td><td class="${item.gap ? 'shortage-value' : 'impact-positive'}">${item.gap ? '−' + item.gap : 'Covered'}</td></tr>`).join('');
-      const impact = `
-        <tr><td>Coverage rate</td><td class="text-muted">91%</td><td class="impact-positive">96%</td><td class="impact-positive">+5 pts</td></tr>
-        <tr><td>Average delivery time</td><td class="text-muted">54 min</td><td class="impact-positive">39 min</td><td class="impact-positive">−15 min</td></tr>
-        <tr><td>Unassigned kits</td><td class="text-muted">12</td><td class="impact-positive">4</td><td class="impact-positive">−8</td></tr>`;
+      const plan = state.plan;
+      if (!plan) return placeholderMarkup('Loading allocation plan from GET /plan…');
+      const s = plan.summary;
+      const gap = s.total_demand - s.total_delivered;
+      const partial = plan.shelters.filter(item => item.unmet > 0).length;
+      const unreachable = new Set(plan.unreachable || []);
+      const coverage = s.total_demand ? Math.round(1000 * s.total_delivered / s.total_demand) / 10 : 100;
+      const worst = plan.shelters.find(item => item.shelter_id === s.worst_shelter);
+      const assignments = plan.shipments.length
+        ? plan.shipments.map(item => `<tr><td><span class="route">${escapeHtml(item.warehouse_name)} <span class="route-arrow">→</span> ${escapeHtml(item.shelter_name)}</span></td><td><strong>${fmt(item.kits)}</strong></td><td>${fmt(item.eta_minutes)} min</td><td><span class="tag neutral">${escapeHtml(item.truck_id)} · ${fmt(item.trips)} ${item.trips === 1 ? 'trip' : 'trips'}</span></td></tr>`).join('')
+        : '<tr><td colspan="4" class="text-muted">No shipments in the current plan.</td></tr>';
+      const shortages = plan.shelters.map(item => `<tr><td><strong>${escapeHtml(item.shelter_name)}</strong></td><td>${fmt(item.demand)}</td><td>${fmt(item.delivered)}</td><td class="${item.unmet ? 'shortage-value' : 'impact-positive'}">${item.unmet ? '−' + fmt(item.unmet) + (unreachable.has(item.shelter_id) ? ' · unreachable' : '') : 'Covered'}</td></tr>`).join('');
+      const statusNote = ['ok', 'optimal'].includes(plan.status) ? '' : ` (${plan.status})`;
+      const footerLeft = state.incident.confirmed ? '<strong>Plan recomputed after confirmed incident</strong>'
+        : state.incident.comparison ? 'Current saved plan · Before vs. revised is a preview'
+        : 'Current saved plan · Confirm an incident to revise';
       return `
         <div class="plan-summary">
-          <div class="summary-card"><div class="summary-label">Kits assigned</div><div class="summary-value">${assigned} / 90</div><div class="summary-note">Across 3 active routes</div></div>
-          <div class="summary-card"><div class="summary-label">Remaining gap</div><div class="summary-value" style="color:var(--danger)">${gap} kits</div><div class="summary-note">2 shelters partially covered</div></div>
-          ${expanded ? '<div class="summary-card"><div class="summary-label">Est. completion</div><div class="summary-value">51 min</div><div class="summary-note">Longest active route</div></div><div class="summary-card"><div class="summary-label">Coverage</div><div class="summary-value" style="color:var(--success)">96%</div><div class="summary-note">5 points above prior plan</div></div>' : ''}
+          <div class="summary-card"><div class="summary-label">Kits assigned</div><div class="summary-value">${fmt(s.total_delivered)} / ${fmt(s.total_demand)}</div><div class="summary-note">Across ${fmt(plan.shipments.length)} truck shipments</div></div>
+          <div class="summary-card"><div class="summary-label">Remaining gap</div><div class="summary-value" style="color:${gap ? 'var(--danger)' : 'var(--success)'}">${fmt(gap)} kits</div><div class="summary-note">${fmt(partial)} shelters partially covered${unreachable.size ? ` · ${fmt(unreachable.size)} unreachable` : ''}</div></div>
+          ${expanded ? `<div class="summary-card"><div class="summary-label">Truck-hours</div><div class="summary-value">${escapeHtml(s.truck_hours)} h</div><div class="summary-note">${fmt(s.trips)} trips planned</div></div><div class="summary-card"><div class="summary-label">Coverage</div><div class="summary-value" style="color:var(--success)">${coverage}%</div><div class="summary-note">Worst-off: ${escapeHtml(worst ? worst.shelter_name : 'none')} at ${Math.round(s.worst_coverage * 1000) / 10}%</div></div>` : ''}
         </div>
         <div class="plan-content-grid">
-          <section class="data-card"><div class="data-card-header"><span class="data-card-title">Food assignments</span><span class="tag success">3 routes</span></div><div class="table-wrap"><table><thead><tr><th>Route</th><th>Kits</th><th>ETA</th><th>Status</th></tr></thead><tbody>${assignments}</tbody></table></div></section>
-          <section class="data-card"><div class="data-card-header"><span class="data-card-title">Shelter shortages</span><span class="tag warning">4-kit gap</span></div><div class="table-wrap"><table><thead><tr><th>Shelter</th><th>Need</th><th>Assigned</th><th>Gap</th></tr></thead><tbody>${shortages}</tbody></table></div></section>
-          <section class="data-card"><div class="data-card-header"><span class="data-card-title">Before vs. revised plan</span><span class="tag success">Improved</span></div><div class="table-wrap"><table><thead><tr><th>Metric</th><th>Before</th><th>Revised</th><th>Impact</th></tr></thead><tbody>${impact}</tbody></table></div></section>
+          <section class="data-card"><div class="data-card-header"><span class="data-card-title">Food assignments</span><span class="tag success">${fmt(plan.shipments.length)} shipments</span></div><div class="table-wrap"><table><thead><tr><th>Route</th><th>Kits</th><th title="One-way drive time per trip, excluding loading">ETA</th><th>Truck</th></tr></thead><tbody>${assignments}</tbody></table></div></section>
+          <section class="data-card"><div class="data-card-header"><span class="data-card-title">Shelter shortages</span><span class="tag ${gap ? 'warning' : 'success'}">${fmt(gap)}-kit gap</span></div><div class="table-wrap"><table><thead><tr><th>Shelter</th><th>Need</th><th>Assigned</th><th>Gap</th></tr></thead><tbody>${shortages}</tbody></table></div></section>
+          ${comparisonMarkup()}
         </div>
-        <div class="plan-footer"><span>${state.incidentConfirmed ? '<strong>Plan revised for confirmed incident</strong>' : 'Baseline allocation · Confirm an incident to revise'}</span><span>Optimizer preview · Demo</span></div>`;
+        <div class="plan-footer"><span>${footerLeft}</span><span>${state.connection === 'online' ? 'Live' : 'Last loaded'} · ${escapeHtml(plan.method)} planner${escapeHtml(statusNote)} · ${state.planGeneratedAt ? escapeHtml(formatTime(new Date(state.planGeneratedAt))) : ''}</span></div>`;
+    }
+
+    // Re-render the incident form without losing the user's focus or cursor.
+    function renderIncident() {
+      const active = document.activeElement;
+      const activeForm = active && active.closest ? active.closest('[data-incident-form]') : null;
+      const restore = activeForm && active.dataset.focus
+        ? { context: activeForm.dataset.incidentForm, key: active.dataset.focus, start: active.selectionStart, end: active.selectionEnd }
+        : null;
+      qs('#incident-content').innerHTML = incidentMarkup('main');
+      bindIncidentControls(qs('#incident-content'));
+      if (state.activeModal === 'incident') renderModalContent('incident');
+      if (!restore) return;
+      const root = restore.context === 'modal' ? qs('#modal-body') : qs('#incident-content');
+      const target = qs(`[data-focus="${restore.key}"]`, root);
+      if (target && !target.disabled) {
+        target.focus();
+        if (target.tagName === 'TEXTAREA' && restore.start != null) target.setSelectionRange(restore.start, restore.end);
+      }
+    }
+
+    function renderDashboard() {
+      qs('#state-content').innerHTML = stateMarkup(false);
+      qs('#plan-content').innerHTML = planMarkup(false);
+      const updated = state.data && state.data.last_updated;
+      qs('#last-updated').textContent = updated ? formatTime(new Date(updated)) : state.data ? 'No incidents yet' : '—';
+      if (state.activeModal === 'state' || state.activeModal === 'plan') renderModalContent(state.activeModal);
     }
 
     function renderAll() {
-      qs('#state-content').innerHTML = stateMarkup(false);
-      qs('#incident-content').innerHTML = incidentMarkup('main');
-      qs('#plan-content').innerHTML = planMarkup(false);
-      bindIncidentControls(qs('#incident-content'));
-      qs('#last-updated').textContent = formatTime();
-      if (state.activeModal) renderModalContent(state.activeModal);
+      renderDashboard();
+      renderIncident();
     }
 
-    function analyzeIncident(text) {
-      const normalized = text.toLowerCase();
-      const severe = /closed|destroyed|blocked|critical|collapse|wildfire/.test(normalized);
-      const locationMatch = text.match(/(?:near|at|in)\s+([A-Z][\w]*(?:\s+[A-Z0-9][\w-]*){0,3})/);
-      const delayMatch = text.match(/(?:approximately|about|for)?\s*(\d+)\s*(hour|hours|minute|minutes)/i);
-      state.extraction = {
-        type: /flood|water/.test(normalized) ? 'Flooding / route closure' : /fire|smoke/.test(normalized) ? 'Fire disruption' : /vehicle|truck|breakdown/.test(normalized) ? 'Vehicle disruption' : 'Distribution disruption',
-        severity: severe ? 'Critical' : 'High',
-        location: locationMatch ? locationMatch[1] : 'Location requires confirmation',
-        delay: delayMatch ? `${delayMatch[1]} ${delayMatch[2]}` : 'Approximately 2 hours',
-        impact: /warehouse|depot|inventory/.test(normalized) ? 'Warehouse availability' : '1 delivery route · 28 kits',
-        action: severe ? 'Reroute via South Bay Hub' : 'Monitor and adjust dispatch'
-      };
-      state.analyzed = true;
+    function setConnection(status, message = '') {
+      state.connection = status;
+      state.connectionMessage = message;
+      const online = status === 'online';
+      const pill = qs('#api-status');
+      const label = online ? 'Live API connected' : status === 'offline' ? 'API unavailable' : 'Connecting to API…';
+      pill.innerHTML = `<span class="mini-dot"${status === 'offline' ? ' style="background:var(--danger)"' : ''}></span><strong>${label}</strong>`;
+      qs('#sync-block').classList.toggle('offline', status === 'offline');
+      const banner = qs('#connection-banner');
+      if (status === 'offline') {
+        const stale = state.data ? ' Showing the last data loaded from the API.' : '';
+        qs('#connection-message').innerHTML = `<strong>Backend unavailable:</strong> ${escapeHtml(message)}${stale}`;
+        banner.classList.add('visible');
+      } else {
+        banner.classList.remove('visible');
+      }
+    }
+
+    // GET /health, then GET /state and GET /plan together. Concurrent calls share one request.
+    function loadDashboard({ announce = false } = {}) {
+      if (dashboardRequest) return dashboardRequest;
+      dashboardRequest = (async () => {
+        try {
+          await api.health();
+          const [snapshot, planResponse] = await Promise.all([api.getState(), api.getPlan()]);
+          const key = pickPlanKey(planResponse.plans);
+          state.data = snapshot;
+          state.plan = key ? planResponse.plans[key] : null;
+          state.planGeneratedAt = planResponse.generated_at;
+          setConnection('online');
+          if (announce) showToast('Command center refreshed', 'Live data loaded from the CrisisOps API.');
+          return true;
+        } catch (error) {
+          setConnection('offline', error.message);
+          if (announce) showToast('Refresh failed', error.message, 'warning');
+          return false;
+        } finally {
+          dashboardRequest = null;
+          renderDashboard();
+        }
+      })();
+      return dashboardRequest;
+    }
+
+    // POST /incidents/parse (no database change), then POST /plan/preview (also no change).
+    async function analyzeIncident(text) {
+      const seq = ++incidentSeq;
+      state.incident = { ...emptyIncident(), text, parsing: true };
+      renderAll();
+      try {
+        const operation = await api.parseIncident(text);
+        if (seq !== incidentSeq) return;
+        state.incident.operation = operation;
+        state.incident.parsing = false;
+        state.incident.previewing = true;
+        if (state.connection !== 'online') loadDashboard();   // API is back: reload stale panels
+        renderAll();
+        showToast('Incident interpreted', 'Review the structured operation and the impact preview, then confirm.');
+      } catch (error) {
+        if (seq !== incidentSeq) return;
+        state.incident.parsing = false;
+        state.incident.error = error.message;
+        renderAll();
+        showToast('Could not interpret incident', error.message, 'warning');
+        return;
+      }
+      await previewIncident(seq);
+    }
+
+    async function previewIncident(seq) {
+      const { text, operation } = state.incident;
+      try {
+        const result = await api.previewPlan({ text, operation });
+        if (seq !== incidentSeq) return;
+        state.incident.resolved = result.operation;
+        state.incident.comparison = result.comparison[pickPlanKey(result.after)] || null;
+      } catch (error) {
+        if (seq !== incidentSeq) return;
+        state.incident.previewError = error.message;
+        // 422 = the backend validated and rejected this operation; apply would fail too.
+        state.incident.previewBlocksConfirm = error.status === 422;
+      } finally {
+        if (seq === incidentSeq) {
+          state.incident.previewing = false;
+          renderAll();
+        }
+      }
+    }
+
+    // POST /incidents/apply with the original text and the exact parsed operation.
+    async function confirmIncident() {
+      if (!canConfirm()) return;           // also blocks double clicks while applying
+      const incident = state.incident;
+      incident.applying = true;
+      incident.error = '';
+      renderAll();
+      try {
+        const result = await api.applyIncident({ text: incident.text, operation: incident.operation });
+        incident.applying = false;
+        incident.confirmed = true;
+        incident.resolved = result.operation;
+        renderAll();
+        showToast('Incident confirmed', 'The database was updated and the allocation plan was recomputed.');
+        const refreshed = await loadDashboard();
+        if (!refreshed) showToast('Saved, but refresh failed', 'Select Refresh to load the updated state and plan.', 'warning');
+      } catch (error) {
+        incident.applying = false;
+        if (error.status === 0) {
+          // No readable response: the change may or may not have been saved.
+          incident.uncertain = true;
+          incident.error = `${error.message} The incident may or may not have been saved. Select Refresh to check Current State before reporting it again.`;
+        } else {
+          incident.error = error.message;
+        }
+        renderAll();
+        showToast('Incident not confirmed', error.message, 'warning');
+      }
     }
 
     function bindIncidentControls(root) {
@@ -680,34 +1033,37 @@ PAGE: Final = r'''<!doctype html>
       const form = qs('[data-incident-form]', root);
       if (!form) return;
       const textarea = qs('textarea', form);
+      const confirmButton = qs('[data-confirm]', form);
+      // Editing the text after parsing disables Confirm until it is analyzed again.
+      const syncDraft = () => {
+        state.draftText = textarea.value;
+        confirmButton.disabled = !canConfirm();
+        confirmButton.textContent = confirmLabel();
+      };
+      textarea.addEventListener('input', syncDraft);
       form.addEventListener('submit', event => {
         event.preventDefault();
+        if (state.incident.parsing || state.incident.applying) return;
         const text = textarea.value.trim();
-        if (text.length < 12) { showToast('More detail needed', 'Include a location and a short description of the disruption.', 'warning'); textarea.focus(); return; }
+        if (text.length < 12) { showToast('More detail needed', 'Name the warehouse, shelter, or truck affected and what changed.', 'warning'); textarea.focus(); return; }
+        state.draftText = textarea.value;
         analyzeIncident(text);
-        const context = form.dataset.incidentForm;
-        if (context === 'main') qs('#incident-content').innerHTML = incidentMarkup('main');
-        else qs('#modal-body').innerHTML = incidentMarkup('modal');
-        const refreshedRoot = context === 'main' ? qs('#incident-content') : qs('#modal-body');
-        bindIncidentControls(refreshedRoot);
-        qs('textarea', refreshedRoot).value = text;
-        showToast('Incident interpreted', 'Review the extracted details, then confirm the incident.');
       });
       qs('[data-sample]', form).addEventListener('click', () => {
-        textarea.value = 'Flooding has closed Highway 880 near Oakland, delaying the North Bay delivery by approximately 2 hours and affecting 28 food kits.';
+        textarea.value = 'We lost 40 food kits to flooding at Warehouse A.';
+        syncDraft();
         textarea.focus();
       });
       qs('[data-cancel]', form).addEventListener('click', () => {
-        state.analyzed = false; state.extraction = null; state.incidentConfirmed = false;
-        renderAll(); showToast('Report cleared', 'No incident changes were applied.', 'neutral');
-      });
-      qs('[data-confirm]', form).addEventListener('click', () => {
-        if (!state.analyzed) return;
-        state.incidentConfirmed = true;
-        state.assignments[0] = { ...state.assignments[0], from: 'South Bay Hub', eta: '48 min', status: 'Rerouted' };
+        if (state.incident.applying) return;
+        const wasConfirmed = state.incident.confirmed;
+        incidentSeq++;                     // ignore any parse/preview still in flight
+        state.incident = emptyIncident();
+        state.draftText = '';
         renderAll();
-        showToast('Incident confirmed', 'The allocation preview has been revised for the reported disruption.');
+        showToast('Report cleared', wasConfirmed ? 'The confirmed incident remains saved.' : 'No incident changes were applied.', 'neutral');
       });
+      confirmButton.addEventListener('click', confirmIncident);
     }
 
     const modalMetadata = {
@@ -744,6 +1100,7 @@ PAGE: Final = r'''<!doctype html>
       modal.setAttribute('aria-hidden', 'true');
       document.body.style.overflow = '';
       state.activeModal = null;
+      renderAll();                         // carry modal edits back to the main panels
       const previous = modal.dataset.previousFocus && document.getElementById(modal.dataset.previousFocus);
       if (previous) previous.focus();
     }
@@ -796,18 +1153,18 @@ PAGE: Final = r'''<!doctype html>
           else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
         }
       });
-      qs('#refresh-button').addEventListener('click', () => { qs('#last-updated').textContent = formatTime(); showToast('Command center refreshed', 'Local demonstration data is up to date.'); });
-      const bannerDismissed = sessionStorage.getItem('crisisops-demo-dismissed');
-      if (!bannerDismissed) qs('#connection-banner').classList.add('visible');
-      qs('#dismiss-banner').addEventListener('click', () => { qs('#connection-banner').classList.remove('visible'); sessionStorage.setItem('crisisops-demo-dismissed', 'true'); });
+      qs('#refresh-button').addEventListener('click', () => loadDashboard({ announce: true }));
+      qs('#dismiss-banner').addEventListener('click', () => qs('#connection-banner').classList.remove('visible'));
+      loadDashboard();
     }
 
-    // Stable, isolated boundary for a future API adapter without coupling the UI
-    // to routes that do not yet exist in this repository.
+    // Integration boundary: the API adapter plus read-only access to UI state.
     window.CrisisOps = Object.freeze({
+      api,
       getState: () => JSON.parse(JSON.stringify(state)),
-      refresh: renderAll,
-      version: '1.0.0-demo'
+      refresh: () => loadDashboard(),
+      render: renderAll,
+      version: '1.1.0-live'
     });
 
     initialize();
@@ -829,7 +1186,7 @@ class CrisisOpsHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             payload = json.dumps(
-                {"status": "ok", "service": "crisisops-frontend", "mode": "demo"}
+                {"status": "ok", "service": "crisisops-frontend", "api": API_ORIGIN}
             ).encode("utf-8")
             self._send(payload, "application/json; charset=utf-8")
             return
@@ -847,7 +1204,9 @@ class CrisisOpsHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'")
+        # connect-src lists the API origin so the page's fetch() calls to the
+        # backend on port 8001 are allowed; every other origin stays blocked.
+        self.send_header("Content-Security-Policy", f"default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' {API_ORIGIN}")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -865,6 +1224,7 @@ def validate_page() -> None:
         'id="plan-content"',
         'id="theme-toggle"',
         "window.CrisisOps",
+        f"const API_BASE = '{API_ORIGIN}';",  # page script and CSP must agree
         "</html>",
     )
     missing = [marker for marker in required_markers if marker not in PAGE]

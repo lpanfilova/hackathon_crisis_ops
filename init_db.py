@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Initialize, reset, and operate the CrisisOps SQLite database.
+"""Initialize, reset, and operate the CrisisOps database.
+
+SQLite is the default. With ``DATABASE_BACKEND=dynamodb`` the same commands
+talk to the DynamoDB table instead, and a credential failure stops here rather
+than writing to SQLite.
 
 This script is the single entry point for creating `crisisops.db`, resetting
 it to a known demo state, and running the manager's confirmed operations inside
@@ -33,6 +37,7 @@ import argparse
 import json
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -295,6 +300,42 @@ def _drop_word(text: str, word: str) -> str:
     return rest if head == word and rest else text
 
 
+def match_id(kind: str, value: Any, rows: list) -> str:
+    """Map a reference to an id using rows that have ``id`` and maybe ``name``.
+
+    Same rules as :func:`resolve_id`. ``rows`` may be SQLite rows or plain dicts.
+    """
+    if kind not in _TARGETS:
+        raise ValueError(f"Unknown target kind {kind!r}")
+    _table, word = _TARGETS[kind]
+    wanted = _squash(value)
+    if not wanted:
+        raise ValueError(f"Empty {kind} reference")
+    code = _drop_word(wanted, word)
+
+    has_name = kind != "truck"                     # trucks have no name column
+    levels = [lambda r: _squash(r["id"]) in (wanted, code)]
+    if has_name:
+        levels += [
+            lambda r: _squash(r["name"]) == wanted,
+            lambda r: _drop_word(_squash(r["name"]), word) == code,
+        ]
+    for matches in levels:
+        hits = sorted({r["id"] for r in rows if matches(r)})
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ValueError(
+                f"{kind.capitalize()} {value!r} is ambiguous: matches {', '.join(hits)}"
+            )
+
+    known = ", ".join(
+        f"{r['id']} ({r['name']})" if has_name else r["id"]
+        for r in sorted(rows, key=lambda r: _natural_key(r["id"]))
+    )
+    raise ValueError(f"No {kind} matching {value!r}. Known: {known}")
+
+
 def resolve_id(conn: sqlite3.Connection, kind: str, value: Any) -> str:
     """Map a warehouse/shelter/truck reference to its database id.
 
@@ -308,35 +349,12 @@ def resolve_id(conn: sqlite3.Connection, kind: str, value: Any) -> str:
     """
     if kind not in _TARGETS:
         raise ValueError(f"Unknown target kind {kind!r}")
-    table, word = _TARGETS[kind]
-    wanted = _squash(value)
-    if not wanted:
-        raise ValueError(f"Empty {kind} reference")
-    code = _drop_word(wanted, word)
-
-    has_name = kind != "truck"                     # trucks have no name column
+    table, _word = _TARGETS[kind]
+    has_name = kind != "truck"
     rows = conn.execute(
         f"SELECT id{', name' if has_name else ''} FROM {table};"
     ).fetchall()
-
-    levels = [lambda r: _squash(r["id"]) in (wanted, code)]
-    if has_name:
-        levels += [
-            lambda r: _squash(r["name"]) == wanted,
-            lambda r: _drop_word(_squash(r["name"]), word) == code,
-        ]
-    for matches in levels:
-        hits = sorted({r["id"] for r in rows if matches(r)})
-        if len(hits) == 1:
-            return hits[0]
-        if len(hits) > 1:
-            raise ValueError(f"{kind.capitalize()} {value!r} is ambiguous: matches {', '.join(hits)}")
-
-    known = ", ".join(
-        f"{r['id']} ({r['name']})" if has_name else r["id"]
-        for r in sorted(rows, key=lambda r: _natural_key(r["id"]))
-    )
-    raise ValueError(f"No {kind} matching {value!r}. Known: {known}")
+    return match_id(kind, value, rows)
 
 
 def resolve_operation(conn: sqlite3.Connection, operation: Mapping[str, Any]) -> dict[str, Any]:
@@ -477,6 +495,62 @@ _SMALL_SEED_EVENTS = [
 ]
 
 
+def _use_dynamodb() -> bool:
+    from backend.config import get_database_settings
+
+    return get_database_settings().database_backend == "dynamodb"
+
+
+def _print_dynamo_status(store) -> None:
+    groups = store.grouped()
+    up = {row["id"] for row in groups["warehouses"] if row["is_operational"]}
+    print("Available inventory (operational warehouses):")
+    for row in groups["warehouses"]:
+        if row["id"] in up:
+            print(f"  {row['id']} {row['name']}: {row['usable_stock']} kits")
+    print("Operational trucks:")
+    for row in groups["trucks"]:
+        if row["is_operational"] and row["warehouse_id"] in up:
+            print(f"  {row['id']} @ {row['warehouse_id']}: capacity {row['capacity_kits']}")
+    print("Open routes:")
+    for row in groups["delivery_routes"]:
+        if row["is_open"] and row["warehouse_id"] in up:
+            print(f"  {row['warehouse_id']} -> {row['shelter_id']}: {row['distance_km']} km")
+    print("Shelter demand (by priority):")
+    for row in sorted(groups["shelters"], key=lambda item: (item["priority"], _natural_key(item["id"]))):
+        print(f"  {row['id']} {row['name']}: demand {row['demand']} (priority {row['priority']})")
+    print(f"Transactions: {len(groups['transactions'])}")
+
+
+def _dynamo_commands(command: str, scenario: Path | str | None, label: str) -> None:
+    from backend.database import DatabaseUnavailable
+    from backend.dynamodb_store import get_dynamo_store
+
+    store = get_dynamo_store()
+    try:
+        if command == "init":
+            created = store.init_if_missing(scenario)
+            state = "loaded" if created else "already has data"
+            print(f"DynamoDB table {store.table_name!r} {state} ({label}).")
+        elif command == "reset":
+            store.reset(scenario)
+            print(f"DynamoDB table {store.table_name!r} reset from {label}.")
+        elif command == "status":
+            store.init_if_missing(scenario)
+            _print_dynamo_status(store)
+        elif command == "demo":
+            store.reset(scenario)
+            events = (_SMALL_SEED_EVENTS if scenario is None else
+                      [(event["text"], event["operation"]) for event in load_scenario(scenario).get("events", [])])
+            for text, operation in events:
+                store.apply_operation(operation, text)
+            print(f"Reset {store.table_name!r} from {label} and applied {len(events)} events.\n")
+            _print_dynamo_status(store)
+    except DatabaseUnavailable as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="CrisisOps database tool")
     parser.add_argument(
@@ -493,6 +567,9 @@ def main() -> None:
     args = parser.parse_args()
     scenario = None if args.small else args.scenario
     label = "small seed" if scenario is None else Path(scenario).name
+    if _use_dynamodb():
+        _dynamo_commands(args.command, scenario, label)
+        return
 
     if args.command == "init":
         created = init_db(scenario=scenario)

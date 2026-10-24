@@ -76,3 +76,31 @@ class AllocatorSettings(BaseSettings):
 def get_allocator_settings() -> AllocatorSettings:
     """Return a cached AllocatorSettings instance."""
     return AllocatorSettings()
+
+
+class DatabaseSettings(BaseSettings):
+    """Which database this process uses.
+
+    ``sqlite`` is the default. ``dynamodb`` is all-or-nothing for the process:
+    a missing credential or table is an error, and requests are not written to
+    SQLite instead. Fully defaulted so tests and the local demo need no AWS
+    configuration.
+    """
+
+    database_backend: Literal["sqlite", "dynamodb"] = "sqlite"
+    dynamodb_table: str = "crisisops"
+    dynamodb_scenario: str = "bay-county"
+    # Empty means boto3's own region resolution (env, then AWS CLI config).
+    aws_region: str = ""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+@lru_cache
+def get_database_settings() -> DatabaseSettings:
+    """Return a cached DatabaseSettings instance."""
+    return DatabaseSettings()
