@@ -18,6 +18,11 @@ venv/
 env/
 ENV/
 
+# SQLite databases (reproducible from schema.sql + seed.sql via init_db.py)
+*.db
+*.sqlite
+*.sqlite3
+
 # Test / coverage artifacts
 .pytest_cache/
 .coverage
