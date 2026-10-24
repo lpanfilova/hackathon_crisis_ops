@@ -44,6 +44,15 @@ from pydantic import BaseModel, Field, ValidationError, field_validator, model_v
 from backend.config import get_settings
 
 
+# Shown when the model returns no operation and no CANNOT_PARSE reason,
+# e.g. for "hello" or anything that isn't an incident report.
+NOT_AN_INCIDENT = (
+    "That doesn't look like an incident report. Describe one change, "
+    "for example: 'Warehouse A lost 40 food kits.'"
+)
+_MAX_REASON_CHARS = 200
+
+
 class ParseError(Exception):
     """Raised when the model cannot confidently parse the input.
 
@@ -302,13 +311,14 @@ def parse_incident(text: str) -> IncidentUpdate:
 
     tool_input = _extract_tool_input(response)
     if tool_input is None:
-        reason = _extract_decline_reason(response)
-        raise ParseError(reason or "Could not parse a valid operation.")
+        raise ParseError(_extract_decline_reason(response) or NOT_AN_INCIDENT)
 
     try:
         return IncidentUpdate.model_validate(tool_input)
     except ValidationError as exc:
-        raise ParseError(f"Model output failed validation: {exc}") from exc
+        # One readable line for the UI, not Pydantic's multi-line dump.
+        details = "; ".join(e["msg"].removeprefix("Value error, ") for e in exc.errors())
+        raise ParseError(f"Incomplete incident: {details}") from exc
 
 
 # Backward-compatible alias for the original function name.
@@ -326,17 +336,19 @@ def _extract_tool_input(response: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _extract_decline_reason(response: dict[str, Any]) -> str | None:
-    """Extract a plain-text decline reason ('CANNOT_PARSE: ...') if present."""
+    """Return the model's 'CANNOT_PARSE: <reason>' reason, if it gave one.
+
+    Any other text (e.g. the model chatting back at "hello") returns None, so
+    the caller shows NOT_AN_INCIDENT instead of echoing the chat to the user.
+    """
     message = response.get("output", {}).get("message", {})
-    texts = [
-        block["text"]
-        for block in message.get("content", [])
-        if "text" in block
-    ]
-    joined = " ".join(texts).strip()
-    if not joined:
-        return None
+    joined = " ".join(
+        block["text"] for block in message.get("content", []) if "text" in block
+    ).strip()
     marker = "CANNOT_PARSE:"
-    if marker in joined:
-        return joined.split(marker, 1)[1].strip() or "Input could not be parsed."
-    return joined
+    if marker not in joined:
+        return None
+    reason = " ".join(joined.split(marker, 1)[1].split())
+    if len(reason) > _MAX_REASON_CHARS:
+        reason = reason[: _MAX_REASON_CHARS - 1].rstrip() + "…"
+    return reason or None

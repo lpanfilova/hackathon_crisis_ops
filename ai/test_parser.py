@@ -219,3 +219,41 @@ def test_legacy_aliases_exist():
 
     assert InventoryUpdate is IncidentUpdate
     assert InventoryAction is IncidentAction
+
+
+# --- Off-topic and unclear input -------------------------------------------
+
+
+def test_chatty_reply_shows_friendly_message(mock_bedrock):
+    """If the model chats instead of declining, don't echo the chat."""
+    mock_bedrock(_text_response(
+        "Hello! I'm doing well, thank you for asking! I'm here to help you "
+        "record CrisisOps incidents. What's the situation on your end?"
+    ))
+    with pytest.raises(ParseError) as exc:
+        parse_incident("hello, how is everyone doing?")
+    assert str(exc.value) == parser.NOT_AN_INCIDENT
+
+
+def test_empty_reply_shows_friendly_message(mock_bedrock):
+    mock_bedrock({"output": {"message": {"content": []}}})
+    with pytest.raises(ParseError) as exc:
+        parse_incident("asdf")
+    assert str(exc.value) == parser.NOT_AN_INCIDENT
+
+
+def test_long_decline_reason_is_capped(mock_bedrock):
+    mock_bedrock(_text_response("CANNOT_PARSE: " + "word " * 200))
+    with pytest.raises(ParseError) as exc:
+        parse_incident("something vague")
+    assert len(str(exc.value)) <= 200
+    assert str(exc.value).endswith("…")
+
+
+def test_validation_error_is_one_readable_line(mock_bedrock):
+    mock_bedrock(_tool_response(action="decrease_stock", warehouse="A"))
+    with pytest.raises(ParseError) as exc:
+        parse_incident("Warehouse A lost some kits.")
+    message = str(exc.value)
+    assert message == "Incomplete incident: action 'decrease_stock' requires: quantity"
+    assert "\n" not in message
