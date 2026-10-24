@@ -24,13 +24,14 @@ Usage:
     Any command accepts --scenario PATH to use another scenario JSON.
 
 Programmatic use:
-    from init_db import connect, apply_operation, reset_db
+    from init_db import connect, apply_operation, reset_db, resolve_operation
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Mapping
@@ -270,17 +271,105 @@ def set_route_open(
         )
 
 
+# --- Id resolution -----------------------------------------------------------
+# The parser keeps what the manager said ("Warehouse A" -> 'A', "Shelter 3" ->
+# '3'), while rows use ids ('W1', 'S3'). Resolution is a lookup against the
+# current rows, not a fixed table, so new warehouses and shelters just work.
+
+# operation field -> (table, leading word of names in that table)
+_TARGETS: dict[str, tuple[str, str]] = {
+    "warehouse": ("warehouses", "warehouse"),
+    "shelter": ("shelters", "shelter"),
+    "truck": ("trucks", "truck"),
+}
+
+
+def _squash(text: Any) -> str:
+    """Case- and whitespace-insensitive form: '  Warehouse   A ' -> 'warehouse a'."""
+    return " ".join(str(text).split()).casefold()
+
+
+def _drop_word(text: str, word: str) -> str:
+    """'warehouse a' -> 'a'; text without that leading word is returned as-is."""
+    head, _, rest = text.partition(" ")
+    return rest if head == word and rest else text
+
+
+def resolve_id(conn: sqlite3.Connection, kind: str, value: Any) -> str:
+    """Map a warehouse/shelter/truck reference to its database id.
+
+    Accepts, ignoring case and extra spaces, in this order of precedence:
+      1. the id itself:           'W1', 'w1', 'Truck T1'
+      2. the full name:           'Warehouse A', 'Shelter 3'
+      3. the code after the word: 'A', '3' (what the parser returns)
+
+    Raises ValueError if nothing matches, or if a reference matches more than
+    one row at the same level.
+    """
+    if kind not in _TARGETS:
+        raise ValueError(f"Unknown target kind {kind!r}")
+    table, word = _TARGETS[kind]
+    wanted = _squash(value)
+    if not wanted:
+        raise ValueError(f"Empty {kind} reference")
+    code = _drop_word(wanted, word)
+
+    has_name = kind != "truck"                     # trucks have no name column
+    rows = conn.execute(
+        f"SELECT id{', name' if has_name else ''} FROM {table};"
+    ).fetchall()
+
+    levels = [lambda r: _squash(r["id"]) in (wanted, code)]
+    if has_name:
+        levels += [
+            lambda r: _squash(r["name"]) == wanted,
+            lambda r: _drop_word(_squash(r["name"]), word) == code,
+        ]
+    for matches in levels:
+        hits = sorted({r["id"] for r in rows if matches(r)})
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            raise ValueError(f"{kind.capitalize()} {value!r} is ambiguous: matches {', '.join(hits)}")
+
+    known = ", ".join(
+        f"{r['id']} ({r['name']})" if has_name else r["id"]
+        for r in sorted(rows, key=lambda r: _natural_key(r["id"]))
+    )
+    raise ValueError(f"No {kind} matching {value!r}. Known: {known}")
+
+
+def resolve_operation(conn: sqlite3.Connection, operation: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy of ``operation`` with warehouse/shelter/truck replaced by ids.
+
+    Idempotent: an operation that already uses ids comes back unchanged.
+    """
+    resolved = dict(operation)
+    for field in _TARGETS:
+        value = resolved.get(field)
+        if value is not None and value != "":
+            resolved[field] = resolve_id(conn, field, value)
+    return resolved
+
+
+def _natural_key(value: str) -> list[Any]:
+    """Sort 'S2' before 'S10'."""
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", value)]
+
+
 def apply_operation(
     conn: sqlite3.Connection, operation: Mapping[str, Any], description: str
 ) -> None:
     """Apply one structured operation to the database.
 
     ``operation`` uses the incident parser's action names and fields
-    (action, warehouse, shelter, truck, quantity) with database ids such as
-    'W1', 'S3', 'T1'. Raises ValueError for an unknown action, a missing
-    field, an unknown id, or a negative quantity, and sqlite3.IntegrityError
-    if the change would make stock or demand negative.
+    (action, warehouse, shelter, truck, quantity). Targets may be database ids
+    ('W1', 'S3', 'T1') or what the parser returns ('A', '3'); see
+    ``resolve_id``. Raises ValueError for an unknown action, a missing field,
+    an unknown or ambiguous target, or a negative quantity, and
+    sqlite3.IntegrityError if the change would make stock or demand negative.
     """
+    operation = resolve_operation(conn, operation)
     action = operation.get("action")
 
     def need(field: str) -> Any:
