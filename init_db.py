@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """Initialize, reset, and operate the CrisisOps SQLite database.
 
-This script is the single entry point for creating `crisisops.db` from
-`schema.sql` + `seed.sql`, resetting it to the original demo state, and running
-the manager's confirmed operations inside transactions (each of which also
-records a row in `incidents`).
+This script is the single entry point for creating `crisisops.db`, resetting
+it to a known demo state, and running the manager's confirmed operations inside
+transactions (each of which also records a row in `incidents`).
 
-The allocation algorithm is intentionally NOT implemented here.
+Two datasets can be loaded:
+
+* the Bay County demo scenario, `data/demo_scenario.json` (default):
+  4 warehouses, 10 shelters, 8 trucks, 40 routes
+* the small seed, `backend/seed.sql` (`--small`): 2 warehouses, 3 shelters,
+  2 trucks, 6 routes; used by unit tests
+
+The allocation algorithm lives in `optimization/allocator.py`, not here.
 
 Usage:
-    python init_db.py init          # create db if missing (no-op if present)
-    python init_db.py reset         # drop + rebuild to original demo state
-    python init_db.py status        # print current inventory/trucks/routes/demand
-    python init_db.py demo          # reset, then apply the six example events
+    python init_db.py init            # create db if missing (no-op if present)
+    python init_db.py reset           # drop + rebuild with the demo scenario
+    python init_db.py reset --small   # drop + rebuild with the small seed
+    python init_db.py status          # print inventory/trucks/routes/demand
+    python init_db.py demo            # reset, then apply the scenario's events
+
+    Any command accepts --scenario PATH to use another scenario JSON.
 
 Programmatic use:
     from init_db import connect, apply_operation, reset_db
@@ -21,14 +30,20 @@ Programmatic use:
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 from pathlib import Path
+from typing import Any, Mapping
 
 # --- Paths -------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "crisisops.db"
 SCHEMA_PATH = BASE_DIR / "backend" / "schema.sql"
 SEED_PATH = BASE_DIR / "backend" / "seed.sql"
+DEFAULT_SCENARIO_PATH = BASE_DIR / "data" / "demo_scenario.json"
+
+# Scenario JSON keys that map to tables, in foreign-key order (parents first).
+_SCENARIO_TABLES = ("warehouses", "shelters", "trucks", "delivery_routes")
 
 
 # --- Connection --------------------------------------------------------------
@@ -49,29 +64,71 @@ def _run_sql_file(conn: sqlite3.Connection, path: Path) -> None:
     conn.executescript(path.read_text(encoding="utf-8"))
 
 
-def reset_db(db_path: Path | str = DB_PATH) -> None:
-    """Rebuild the database to the original demo state.
+def load_scenario(path: Path | str = DEFAULT_SCENARIO_PATH) -> dict[str, Any]:
+    """Read a scenario JSON file."""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _insert_scenario_rows(conn: sqlite3.Connection, data: Mapping[str, Any]) -> None:
+    """Insert a scenario's rows with named columns.
+
+    Every key in a row must be a real column of its table, so a typo in the
+    JSON fails loudly instead of being silently dropped. Keys outside the four
+    tables (name, description, events) are ignored: events become incidents
+    only when they are actually applied.
+    """
+    for table in _SCENARIO_TABLES:
+        columns = [r["name"] for r in conn.execute(f"PRAGMA table_info({table});")]
+        for row in data.get(table, []):
+            unknown = sorted(set(row) - set(columns))
+            if unknown:
+                raise ValueError(f"{table}: unknown column(s) {unknown} in scenario row {row}")
+            use = [c for c in columns if c in row]
+            conn.execute(
+                f"INSERT INTO {table} ({', '.join(use)}) "
+                f"VALUES ({', '.join('?' * len(use))});",
+                [row[c] for c in use],
+            )
+
+
+def reset_db(
+    db_path: Path | str = DB_PATH,
+    scenario: Path | str | None = DEFAULT_SCENARIO_PATH,
+) -> None:
+    """Rebuild the database from scratch.
+
+    Args:
+        db_path: database file to (re)create.
+        scenario: scenario JSON to load (default: the Bay County demo).
+            Pass None to load the small `seed.sql` instead.
 
     schema.sql drops existing tables first, so this is a clean rebuild whether
-    or not the file already exists. Wrapped in a single transaction.
+    or not the file already exists. The data load runs in one transaction.
     """
+    data = load_scenario(scenario) if scenario is not None else None
     conn = connect(db_path)
     try:
-        with conn:  # transaction: commits on success, rolls back on error
-            _run_sql_file(conn, SCHEMA_PATH)
+        _run_sql_file(conn, SCHEMA_PATH)
+        if data is None:
             _run_sql_file(conn, SEED_PATH)
+        else:
+            with conn:  # commits on success, rolls back on error
+                _insert_scenario_rows(conn, data)
     finally:
         conn.close()
 
 
-def init_db(db_path: Path | str = DB_PATH) -> bool:
+def init_db(
+    db_path: Path | str = DB_PATH,
+    scenario: Path | str | None = DEFAULT_SCENARIO_PATH,
+) -> bool:
     """Create the database only if it does not already exist.
 
     Returns True if it created the database, False if it was already present.
     """
     if Path(db_path).exists():
         return False
-    reset_db(db_path)
+    reset_db(db_path, scenario)
     return True
 
 
@@ -141,6 +198,20 @@ def adjust_warehouse_stock(
         )
 
 
+def set_warehouse_stock(
+    conn: sqlite3.Connection, warehouse_id: str, quantity: int, description: str
+) -> None:
+    """Set a warehouse's usable stock to an absolute value (>= 0 enforced)."""
+    with conn:
+        cur = conn.execute(
+            "UPDATE warehouses SET usable_stock = ? WHERE id = ?;",
+            (quantity, warehouse_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"No warehouse with id {warehouse_id!r}")
+        _record_incident(conn, "stock_set", warehouse_id, description)
+
+
 def set_shelter_demand(
     conn: sqlite3.Connection, shelter_id: str, demand: int, description: str
 ) -> None:
@@ -199,6 +270,54 @@ def set_route_open(
         )
 
 
+def apply_operation(
+    conn: sqlite3.Connection, operation: Mapping[str, Any], description: str
+) -> None:
+    """Apply one structured operation to the database.
+
+    ``operation`` uses the incident parser's action names and fields
+    (action, warehouse, shelter, truck, quantity) with database ids such as
+    'W1', 'S3', 'T1'. Raises ValueError for an unknown action, a missing
+    field, an unknown id, or a negative quantity, and sqlite3.IntegrityError
+    if the change would make stock or demand negative.
+    """
+    action = operation.get("action")
+
+    def need(field: str) -> Any:
+        value = operation.get(field)
+        if value is None or value == "":
+            raise ValueError(f"Action {action!r} requires {field!r}")
+        return value
+
+    def quantity() -> int:
+        qty = int(need("quantity"))
+        if qty < 0:
+            raise ValueError(f"quantity must be >= 0, got {qty}")
+        return qty
+
+    if action in ("increase_stock", "decrease_stock"):
+        qty = quantity()
+        adjust_warehouse_stock(
+            conn, need("warehouse"), qty if action == "increase_stock" else -qty, description
+        )
+    elif action == "set_stock":
+        set_warehouse_stock(conn, need("warehouse"), quantity(), description)
+    elif action in ("warehouse_offline", "warehouse_online"):
+        set_warehouse_operational(
+            conn, need("warehouse"), action == "warehouse_online", description
+        )
+    elif action == "set_demand":
+        set_shelter_demand(conn, need("shelter"), quantity(), description)
+    elif action in ("truck_offline", "truck_online"):
+        set_truck_operational(conn, need("truck"), action == "truck_online", description)
+    elif action in ("close_route", "open_route"):
+        set_route_open(
+            conn, need("warehouse"), need("shelter"), action == "open_route", description
+        )
+    else:
+        raise ValueError(f"Unknown action {action!r}")
+
+
 # --- Retrieval queries -------------------------------------------------------
 def available_inventory(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Usable stock at operational warehouses only."""
@@ -252,23 +371,21 @@ def _print_status(conn: sqlite3.Connection) -> None:
         print(f"  {r['id']} {r['name']}: demand {r['demand']} (priority {r['priority']})")
 
 
-def _apply_demo_events(conn: sqlite3.Connection) -> None:
-    """Apply the six example manager events from the spec."""
-    set_warehouse_operational(
-        conn, "W2", False, "Warehouse B lost power and stopped shipping."
-    )
-    adjust_warehouse_stock(
-        conn, "W1", -40, "We lost 40 food kits to flooding at Warehouse A."
-    )
-    set_shelter_demand(
-        conn, "S3", 100, "Shelter 3 now needs 100 kits instead of 40."
-    )
-    set_warehouse_operational(conn, "W2", True, "Warehouse B is operational again.")
-    set_truck_operational(conn, "T1", False, "Our delivery truck T1 broke down.")
-    set_route_open(
-        conn, "W1", "S2", False,
-        "The road between Warehouse A and Shelter 2 is blocked.",
-    )
+# The six example events for the small seed.
+_SMALL_SEED_EVENTS = [
+    ("Warehouse B lost power and stopped shipping.",
+     {"action": "warehouse_offline", "warehouse": "W2"}),
+    ("We lost 40 food kits to flooding at Warehouse A.",
+     {"action": "decrease_stock", "warehouse": "W1", "quantity": 40}),
+    ("Shelter 3 now needs 100 kits instead of 40.",
+     {"action": "set_demand", "shelter": "S3", "quantity": 100}),
+    ("Warehouse B is operational again.",
+     {"action": "warehouse_online", "warehouse": "W2"}),
+    ("Our delivery truck T1 broke down.",
+     {"action": "truck_offline", "truck": "T1"}),
+    ("The road between Warehouse A and Shelter 2 is blocked.",
+     {"action": "close_route", "warehouse": "W1", "shelter": "S2"}),
+]
 
 
 def main() -> None:
@@ -276,30 +393,40 @@ def main() -> None:
     parser.add_argument(
         "command",
         choices=["init", "reset", "status", "demo"],
-        help="init: create if missing; reset: rebuild demo state; "
-        "status: print retrieval queries; demo: reset then apply 6 events",
+        help="init: create if missing; reset: rebuild; status: print current "
+        "state; demo: reset, then apply the dataset's example events",
     )
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--small", action="store_true",
+                        help="use the small seed.sql instead of a scenario")
+    source.add_argument("--scenario", default=str(DEFAULT_SCENARIO_PATH),
+                        help="scenario JSON to load (default: %(default)s)")
     args = parser.parse_args()
+    scenario = None if args.small else args.scenario
+    label = "small seed" if scenario is None else Path(scenario).name
 
     if args.command == "init":
-        created = init_db()
-        print(f"Database {'created' if created else 'already exists'}: {DB_PATH}")
+        created = init_db(scenario=scenario)
+        print(f"Database {'created from ' + label if created else 'already exists'}: {DB_PATH}")
     elif args.command == "reset":
-        reset_db()
-        print(f"Database reset to original demo state: {DB_PATH}")
+        reset_db(scenario=scenario)
+        print(f"Database reset from {label}: {DB_PATH}")
     elif args.command == "status":
-        init_db()
+        init_db(scenario=scenario)
         conn = connect()
         try:
             _print_status(conn)
         finally:
             conn.close()
     elif args.command == "demo":
-        reset_db()
+        reset_db(scenario=scenario)
+        events = (_SMALL_SEED_EVENTS if scenario is None else
+                  [(e["text"], e["operation"]) for e in load_scenario(scenario).get("events", [])])
         conn = connect()
         try:
-            _apply_demo_events(conn)
-            print("Applied 6 demo events. Resulting state:\n")
+            for text, operation in events:
+                apply_operation(conn, operation, text)
+            print(f"Reset from {label} and applied {len(events)} events. Resulting state:\n")
             _print_status(conn)
         finally:
             conn.close()

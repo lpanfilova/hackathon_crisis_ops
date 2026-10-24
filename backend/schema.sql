@@ -22,7 +22,10 @@ CREATE TABLE warehouses (
     usable_stock   INTEGER NOT NULL
                            CHECK (usable_stock >= 0),         -- no negative inventory
     is_operational INTEGER NOT NULL DEFAULT 1
-                           CHECK (is_operational IN (0, 1))   -- boolean
+                           CHECK (is_operational IN (0, 1)),  -- boolean
+    -- Optional map position on the simulated km grid (for the frontend map).
+    x_km           REAL,
+    y_km           REAL
 );
 
 -- Shelters request food kits; lower priority number = more urgent.
@@ -33,7 +36,10 @@ CREATE TABLE shelters (
     demand   INTEGER NOT NULL
                      CHECK (demand >= 0),                     -- no negative demand
     priority INTEGER NOT NULL
-                     CHECK (priority >= 1)
+                     CHECK (priority >= 1),
+    -- Optional map position on the simulated km grid (for the frontend map).
+    x_km     REAL,
+    y_km     REAL
 );
 
 -- Trucks belong to a warehouse and carry up to capacity_kits.
