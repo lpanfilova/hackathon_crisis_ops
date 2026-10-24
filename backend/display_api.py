@@ -25,8 +25,9 @@ from pydantic import BaseModel, Field
 
 from ai.incident_parser import IncidentUpdate
 from backend.config import get_allocator_settings
+from backend.database import store_status, use_dynamodb
 from init_db import apply_operation, available_inventory, connect, resolve_operation
-from optimization.allocator import plan_from_db
+from optimization.allocator import PlanningParams, allocate, plan_from_db
 
 router = APIRouter(tags=["display"])
 
@@ -71,22 +72,48 @@ def _available_kits(conn: sqlite3.Connection) -> int:
     return sum(r["usable_stock"] for r in available_inventory(conn))
 
 
+def _decorate_named(
+    plans: dict[str, Any],
+    wh_names: dict[str, str],
+    sh_names: dict[str, str],
+) -> dict[str, Any]:
+    """Add display names and a drive-time ETA so the frontend needs no joins."""
+    speed = get_allocator_settings().avg_speed_kmh
+    for plan in plans.values():
+        for shipment in plan["shipments"]:
+            shipment["warehouse_name"] = wh_names.get(shipment["warehouse_id"], shipment["warehouse_id"])
+            shipment["shelter_name"] = sh_names.get(shipment["shelter_id"], shipment["shelter_id"])
+            shipment["eta_minutes"] = round(shipment["distance_km"] / speed * 60)
+        for shelter in plan["shelters"]:
+            shelter["shelter_name"] = sh_names.get(shelter["shelter_id"], shelter["shelter_id"])
+    return plans
+
+
 def _decorate(plans: dict[str, Any], conn: sqlite3.Connection) -> dict[str, Any]:
     """Add display names and a drive-time ETA so the frontend needs no joins.
 
     eta_minutes is the one-way drive time of a trip (distance / average
     speed), excluding loading.
     """
-    wh_names, sh_names = _names(conn)
-    speed = get_allocator_settings().avg_speed_kmh
-    for plan in plans.values():
-        for s in plan["shipments"]:
-            s["warehouse_name"] = wh_names.get(s["warehouse_id"], s["warehouse_id"])
-            s["shelter_name"] = sh_names.get(s["shelter_id"], s["shelter_id"])
-            s["eta_minutes"] = round(s["distance_km"] / speed * 60)
-        for s in plan["shelters"]:
-            s["shelter_name"] = sh_names.get(s["shelter_id"], s["shelter_id"])
-    return plans
+    return _decorate_named(plans, *_names(conn))
+
+
+def _plans_for(net, method: Method | None) -> dict[str, Any]:
+    settings = get_allocator_settings()
+    return allocate(
+        net,
+        method or settings.allocator_method,
+        PlanningParams.from_settings(settings),
+        time_limit_s=settings.optimizer_time_limit_s,
+        rounding_time_s=settings.optimizer_rounding_time_s,
+    )
+
+
+def _raise_store(exc: Exception) -> None:
+    mapped = store_status(exc)
+    if mapped is not None:
+        raise mapped from exc
+    raise exc
 
 
 # --- GET /state --------------------------------------------------------------
@@ -101,6 +128,8 @@ def get_state() -> dict[str, Any]:
     ``last_updated`` is the newest incident time (UTC), or null before any
     incident; ``generated_at`` is when this response was built.
     """
+    if use_dynamodb():
+        return _state_from_dynamodb()
     conn = _open()
     try:
         warehouses = [dict(r) for r in conn.execute(
@@ -167,6 +196,8 @@ def get_plan(
     ``shelters`` (demand, delivered, unmet, coverage) the Shelter Shortage
     table.
     """
+    if use_dynamodb():
+        return _plan_from_dynamodb(method)
     conn = _open()
     try:
         plans = _decorate(plan_from_db(conn, method=method), conn)
@@ -242,6 +273,8 @@ def preview_plan(request: PreviewRequest) -> dict[str, Any]:
     (A, 3), as for /incidents/apply; the response echoes the resolved ids.
     """
     operation = request.operation.model_dump(mode="json", exclude_none=True)
+    if use_dynamodb():
+        return _preview_dynamodb(request, operation)
     disk = _open()
     scratch = sqlite3.connect(":memory:")
     scratch.row_factory = sqlite3.Row
@@ -266,6 +299,142 @@ def preview_plan(request: PreviewRequest) -> dict[str, Any]:
         scratch.close()
         disk.close()
 
+    comparison = {
+        name: {
+            "metrics": _metric_rows(before[name], after[name], kits_before, kits_after),
+            "shelters": _shelter_rows(before[name], after[name]),
+        }
+        for name in before
+    }
+    return {
+        "saved": False,
+        "generated_at": _now_iso(),
+        "operation": operation,
+        "before": before,
+        "after": after,
+        "comparison": comparison,
+    }
+
+
+def _state_from_dynamodb() -> dict[str, Any]:
+    from backend.dynamodb_store import get_dynamo_store
+
+    store = get_dynamo_store()
+    try:
+        groups = store.grouped()
+    except Exception as exc:
+        _raise_store(exc)
+        raise
+    trucks_by_warehouse: dict[str, list[dict[str, Any]]] = {}
+    for truck in groups["trucks"]:
+        trucks_by_warehouse.setdefault(truck["warehouse_id"], []).append(truck)
+    warehouses = []
+    for row in groups["warehouses"]:
+        owned = trucks_by_warehouse.get(row["id"], [])
+        warehouses.append({
+            "id": row["id"],
+            "name": row["name"],
+            "location": row["location"],
+            "usable_stock": row["usable_stock"],
+            "is_operational": bool(row["is_operational"]),
+            "x_km": row.get("x_km"),
+            "y_km": row.get("y_km"),
+            "trucks_total": len(owned),
+            "trucks_operational": sum(bool(item["is_operational"]) for item in owned),
+        })
+    shelters = [
+        {
+            "id": row["id"], "name": row["name"], "location": row["location"],
+            "demand": row["demand"], "priority": row["priority"],
+            "x_km": row.get("x_km"), "y_km": row.get("y_km"),
+        }
+        for row in groups["shelters"]
+    ]
+    trucks = [
+        {
+            "id": row["id"], "warehouse_id": row["warehouse_id"],
+            "capacity_kits": row["capacity_kits"],
+            "is_operational": bool(row["is_operational"]),
+        }
+        for row in groups["trucks"]
+    ]
+    routes = [
+        {
+            "warehouse_id": row["warehouse_id"], "shelter_id": row["shelter_id"],
+            "distance_km": row["distance_km"], "is_open": bool(row["is_open"]),
+        }
+        for row in groups["delivery_routes"]
+    ]
+    warehouses.sort(key=lambda row: _natural_key(row["id"]))
+    shelters.sort(key=lambda row: _natural_key(row["id"]))
+    trucks.sort(key=lambda row: _natural_key(row["id"]))
+    routes.sort(key=lambda row: (_natural_key(row["warehouse_id"]), _natural_key(row["shelter_id"])))
+    stamps = [row["created_at"] for row in groups["transactions"] if row.get("created_at")]
+    return {
+        "last_updated": max(stamps) if stamps else None,
+        "generated_at": _now_iso(),
+        "summary": {
+            "available_kits": sum(row["usable_stock"] for row in warehouses if row["is_operational"]),
+            "total_stock": sum(row["usable_stock"] for row in warehouses),
+            "warehouses": len(warehouses),
+            "warehouses_operational": sum(row["is_operational"] for row in warehouses),
+            "shelters": len(shelters),
+            "total_demand": sum(row["demand"] for row in shelters),
+            "trucks": len(trucks),
+            "trucks_operational": sum(row["is_operational"] for row in trucks),
+            "routes_closed": sum(not row["is_open"] for row in routes),
+        },
+        "warehouses": warehouses,
+        "shelters": shelters,
+        "trucks": trucks,
+        "routes": routes,
+    }
+
+
+def _plan_from_dynamodb(method: Method | None) -> dict[str, Any]:
+    from backend.dynamodb_store import get_dynamo_store
+
+    store = get_dynamo_store()
+    try:
+        groups = store.grouped()
+        plans = _decorate_named(_plans_for(store.network_scenario(groups).network(), method), *store.names(groups))
+    except Exception as exc:
+        _raise_store(exc)
+        raise
+    return {"generated_at": _now_iso(), "plans": plans}
+
+
+def _preview_dynamodb(request: PreviewRequest, operation: dict[str, Any]) -> dict[str, Any]:
+    from optimization.scenario import Scenario
+
+    from backend.dynamodb_store import get_dynamo_store
+
+    store = get_dynamo_store()
+    try:
+        groups = store.grouped()
+        data = store.scenario_data(groups)
+        operation = store.resolve_operation(operation)
+        before_world = Scenario(data)
+        after_world = Scenario(data)
+        try:
+            after_world.apply(operation)
+        except ValueError as exc:
+            if "negative" in str(exc):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Operation rejected because stock or demand would become negative.",
+                ) from exc
+            raise
+        names = store.names(groups)
+        before = _decorate_named(_plans_for(before_world.network(), request.method), *names)
+        after = _decorate_named(_plans_for(after_world.network(), request.method), *names)
+        kits_before = sum(row["usable_stock"] for row in before_world.data["warehouses"] if row["is_operational"])
+        kits_after = sum(row["usable_stock"] for row in after_world.data["warehouses"] if row["is_operational"])
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_store(exc)
+        raise
     comparison = {
         name: {
             "metrics": _metric_rows(before[name], after[name], kits_before, kits_after),
